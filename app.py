@@ -185,23 +185,34 @@ def get_google_docs_service():
 
 
 def append_to_google_doc(summary_text, meeting_date):
-    """Дописываем резюме в конец Google Doc с форматированием"""
+    """Вставляем резюме в НАЧАЛО Google Doc (после заголовка) с форматированием"""
     service = get_google_docs_service()
 
     doc = service.documents().get(documentId=GOOGLE_DOC_ID).execute()
-    end_index = doc["body"]["content"][-1]["endIndex"] - 1
 
-    separator = "\n\n" + "=" * 60 + "\n"
-    full_text = f"{separator}{meeting_date}\n\n{summary_text}\n"
+    # Находим конец первого абзаца (заголовок документа)
+    # Вставляем после заголовка "РЕЗЮМЕ ВСТРЕЧ 2026 ГОДА" и разделителя
+    # Ищем позицию после второго элемента (заголовок + разделитель)
+    content = doc["body"]["content"]
+    # Вставляем после заголовка: позиция конца 2-го элемента
+    # Если в документе меньше 3 элементов, вставляем в конец первого
+    if len(content) > 2:
+        insert_index = content[2]["startIndex"]
+    else:
+        insert_index = content[-1]["endIndex"] - 1
+
+    # Формируем текст для вставки
+    separator = "=" * 60 + "\n"
+    full_text = f"{separator}{meeting_date}\n\n{summary_text}\n\n"
 
     # Вставляем текст
     service.documents().batchUpdate(
         documentId=GOOGLE_DOC_ID,
-        body={"requests": [{"insertText": {"location": {"index": end_index}, "text": full_text}}]},
+        body={"requests": [{"insertText": {"location": {"index": insert_index}, "text": full_text}}]},
     ).execute()
 
     # Форматируем дату красным + жирным
-    date_start = end_index + len(separator)
+    date_start = insert_index + len(separator)
     date_end = date_start + len(meeting_date)
 
     first_newline = summary_text.index("\n") if "\n" in summary_text else len(summary_text)
@@ -230,7 +241,6 @@ def append_to_google_doc(summary_text, meeting_date):
         documentId=GOOGLE_DOC_ID,
         body={"requests": format_requests},
     ).execute()
-
 
 # ==================== ОБРАБОТКА АУДИО ====================
 
