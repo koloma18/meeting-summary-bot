@@ -382,17 +382,29 @@ def telegram_webhook():
         ))
         return jsonify({"ok": True})
 
-    # Команда /url <ссылка>
-    if "text" in message and message["text"].startswith("/url"):
-        parts = message["text"].split(maxsplit=1)
-        if len(parts) < 2 or not parts[1].strip().startswith("http"):
-            send_message(chat_id, (
-                "⚠️ Укажи ссылку после команды.\n\n"
-                "Пример:\n/url https://drive.google.com/file/d/XXXXX/view"
-            ))
-            return jsonify({"ok": True})
+    # Команда /url <ссылка> ИЛИ просто голая ссылка на Google Drive
+    text = message.get("text", "") or message.get("caption", "")
+    is_url_command = text.startswith("/url")
+    is_bare_gdrive = (
+        not text.startswith("/") and
+        re.search(r'https?://drive\.google\.com/\S+', text)
+    )
 
-        url = parts[1].strip()
+    if "text" in message and (is_url_command or is_bare_gdrive):
+        if is_url_command:
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip().startswith("http"):
+                send_message(chat_id, (
+                    "⚠️ Укажи ссылку после команды.\n\n"
+                    "Пример:\n/url https://drive.google.com/file/d/XXXXX/view"
+                ))
+                return jsonify({"ok": True})
+            url = parts[1].strip()
+        else:
+            # Голая ссылка на Google Drive — извлекаем из текста
+            match = re.search(r'https?://drive\.google\.com/\S+', text)
+            url = match.group(0).rstrip(")")  # убираем случайную скобку в конце
+
         thread = threading.Thread(target=process_from_url, args=(chat_id, url))
         thread.start()
         return jsonify({"ok": True})
