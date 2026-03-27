@@ -73,15 +73,22 @@ def send_message(chat_id, text):
 
 def download_telegram_file(file_id):
     """Скачать файл из Telegram во временный файл"""
-    # Получаем путь к файлу
     resp = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id})
-    file_path = resp.json()["result"]["file_path"]
+    data = resp.json()
 
-    # Скачиваем
+    # Telegram не даёт скачивать файлы >20 МБ через Bot API
+    if not data.get("ok"):
+        raise ValueError(
+            "Файл слишком большой для скачивания через Telegram (лимит 20 МБ).\n\n"
+            "Сожми аудио перед отправкой:\n"
+            "ffmpeg -i audio.m4a -ac 1 -ar 16000 -b:a 32k small.m4a\n\n"
+            "Или используй формат audio_only.m4a из Zoom — он обычно легче видео."
+        )
+
+    file_path = data["result"]["file_path"]
     file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
     response = requests.get(file_url, stream=True)
 
-    # Определяем расширение
     ext = os.path.splitext(file_path)[1] or ".ogg"
     tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
     for chunk in response.iter_content(chunk_size=8192):
