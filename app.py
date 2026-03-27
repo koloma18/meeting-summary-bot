@@ -4,10 +4,10 @@ import json
 import math
 import tempfile
 import threading
+import subprocess
 import requests
 from datetime import datetime
 from flask import Flask, request, jsonify
-from pydub import AudioSegment
 from openai import OpenAI
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -22,6 +22,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 GOOGLE_DOC_ID = os.environ["GOOGLE_DOC_ID"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 
+# Максимальный размер куска для Whisper API (МБ)
 MAX_CHUNK_SIZE_MB = 24
 
 SUMMARY_PROMPT = """Ты — ассистент, который создаёт резюме рабочих встреч для компании Coin Post (криптомедиа).
@@ -79,7 +80,6 @@ def download_telegram_file(file_id):
     resp = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id})
     data = resp.json()
 
-    # Telegram не даёт скачивать файлы >20 МБ через Bot API
     if not data.get("ok"):
         raise ValueError(
             "Файл слишком большой (лимит Telegram — 20 МБ).\n\n"
@@ -104,7 +104,6 @@ def download_file_from_url(url):
     file_id = None
 
     # Конвертируем Google Drive ссылку в прямую ссылку скачивания
-    # Поддерживаем форматы: /file/d/ID/view и /open?id=ID
     gdrive_match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
     if not gdrive_match:
         gdrive_match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
@@ -116,8 +115,7 @@ def download_file_from_url(url):
     session = requests.Session()
     response = session.get(url, stream=True, allow_redirects=True)
 
-    # Google Drive для больших файлов показывает страницу подтверждения (предупреждение о вирусах)
-    # Обходим её через confirm-токен из HTML
+    # Google Drive для больших файлов показывает страницу подтверждения — обходим
     if "text/html" in response.headers.get("Content-Type", ""):
         confirm_match = re.search(r'confirm=([0-9A-Za-z_-]+)', response.text)
         if confirm_match and file_id:
@@ -147,34 +145,77 @@ def download_file_from_url(url):
     return tmp.name
 
 
-# ==================== НАРЕЗКА АУДИО ====================
+# ==================== НАРЕЗКА АУДИО (ffmpeg) ====================
+
+def get_audio_duration(file_path):
+    """Получаем длительность аудио через ffprobe (без загрузки в память)"""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path,
+        ],
+        capture_output=True, text=True
+    )
+    return float(result.stdout.strip())
+
 
 def split_audio(file_path):
-    """Нарезаем аудио на куски по ~24 МБ для Whisper API"""
-    audio = AudioSegment.from_file(file_path)
-    duration_seconds = len(audio) / 1000
+    """
+    Нарезаем аудио на куски по ~24 МБ для Whisper API.
+    Используем ffmpeg напрямую — файл не загружается в память целиком.
+    """
+    duration_seconds = get_audio_duration(file_path)
 
-    # Конвертируем в mp3 для оценки размера
-    tmp_full = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-    audio.export(tmp_full.name, format="mp3", bitrate="64k")
-    file_size_mb = os.path.getsize(tmp_full.name) / (1024 * 1024)
-    os.unlink(tmp_full.name)
+    # Конвертируем в mono mp3 32k и смотрим итоговый размер
+    tmp_probe = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+    tmp_probe.close()
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", file_path,
+            "-ac", "1", "-ar", "16000", "-b:a", "32k",
+            tmp_probe.name,
+        ],
+        capture_output=True
+    )
+    file_size_mb = os.path.getsize(tmp_probe.name) / (1024 * 1024)
+    os.unlink(tmp_probe.name)
 
     if file_size_mb <= MAX_CHUNK_SIZE_MB:
+        # Файл влезает целиком — просто конвертируем
         tmp_single = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-        audio.export(tmp_single.name, format="mp3", bitrate="64k")
+        tmp_single.close()
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", file_path,
+                "-ac", "1", "-ar", "16000", "-b:a", "32k",
+                tmp_single.name,
+            ],
+            capture_output=True
+        )
         return [tmp_single.name], duration_seconds
 
+    # Нарезаем на куски по времени
     num_chunks = math.ceil(file_size_mb / MAX_CHUNK_SIZE_MB)
-    chunk_duration_ms = len(audio) // num_chunks
+    chunk_duration = duration_seconds / num_chunks
 
     chunk_files = []
     for i in range(num_chunks):
-        start = i * chunk_duration_ms
-        end = min((i + 1) * chunk_duration_ms, len(audio))
-        chunk = audio[start:end]
+        start = i * chunk_duration
         tmp_chunk = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-        chunk.export(tmp_chunk.name, format="mp3", bitrate="64k")
+        tmp_chunk.close()
+        subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-ss", str(start),
+                "-t", str(chunk_duration),
+                "-i", file_path,
+                "-ac", "1", "-ar", "16000", "-b:a", "32k",
+                tmp_chunk.name,
+            ],
+            capture_output=True
+        )
         chunk_files.append(tmp_chunk.name)
 
     return chunk_files, duration_seconds
@@ -244,61 +285,54 @@ def get_google_docs_service():
 def append_to_google_doc(summary_text, meeting_date):
     """Вставляем резюме в НАЧАЛО Google Doc (после заголовка) с форматированием"""
     service = get_google_docs_service()
-
     doc = service.documents().get(documentId=GOOGLE_DOC_ID).execute()
 
     content = doc["body"]["content"]
-    # Вставляем после заголовка (3-й элемент), если документ достаточно длинный
     if len(content) > 2:
         insert_index = content[2]["startIndex"]
     else:
         insert_index = content[-1]["endIndex"] - 1
 
-    # Формируем текст для вставки
     separator = "=" * 60 + "\n"
     full_text = f"{separator}{meeting_date}\n\n{summary_text}\n\n"
 
-    # Вставляем текст
     service.documents().batchUpdate(
         documentId=GOOGLE_DOC_ID,
         body={"requests": [{"insertText": {"location": {"index": insert_index}, "text": full_text}}]},
     ).execute()
 
-    # Форматируем дату красным + жирным, первую строку резюме — жирным
     date_start = insert_index + len(separator)
     date_end = date_start + len(meeting_date)
     first_newline = summary_text.index("\n") if "\n" in summary_text else len(summary_text)
 
-    format_requests = [
-        {
-            "updateTextStyle": {
-                "range": {"startIndex": date_start, "endIndex": date_end},
-                "textStyle": {
-                    "bold": True,
-                    "foregroundColor": {"color": {"rgbColor": {"red": 1.0, "green": 0.0, "blue": 0.0}}},
-                },
-                "fields": "bold,foregroundColor",
-            }
-        },
-        {
-            "updateTextStyle": {
-                "range": {"startIndex": date_end + 2, "endIndex": date_end + 2 + first_newline},
-                "textStyle": {"bold": True},
-                "fields": "bold",
-            }
-        },
-    ]
-
     service.documents().batchUpdate(
         documentId=GOOGLE_DOC_ID,
-        body={"requests": format_requests},
+        body={"requests": [
+            {
+                "updateTextStyle": {
+                    "range": {"startIndex": date_start, "endIndex": date_end},
+                    "textStyle": {
+                        "bold": True,
+                        "foregroundColor": {"color": {"rgbColor": {"red": 1.0, "green": 0.0, "blue": 0.0}}},
+                    },
+                    "fields": "bold,foregroundColor",
+                }
+            },
+            {
+                "updateTextStyle": {
+                    "range": {"startIndex": date_end + 2, "endIndex": date_end + 2 + first_newline},
+                    "textStyle": {"bold": True},
+                    "fields": "bold",
+                }
+            },
+        ]},
     ).execute()
 
 
 # ==================== ОБЩИЙ ПАЙПЛАЙН ====================
 
 def run_pipeline(chat_id, audio_path):
-    """Общий пайплайн: обработать аудиофайл → транскрипция → резюме → Google Doc"""
+    """Общий пайплайн: аудиофайл → транскрипция → резюме → Google Doc"""
     try:
         send_message(chat_id, "✂️ Обрабатываю аудио...")
         chunks, duration_sec = split_audio(audio_path)
@@ -365,7 +399,6 @@ def telegram_webhook():
     message = data["message"]
     chat_id = str(message["chat"]["id"])
 
-    # Проверяем, что сообщение от авторизованного пользователя
     if chat_id != TELEGRAM_CHAT_ID:
         send_message(chat_id, "⛔ У тебя нет доступа к этому боту.")
         return jsonify({"ok": True})
@@ -382,7 +415,7 @@ def telegram_webhook():
         ))
         return jsonify({"ok": True})
 
-    # Команда /url <ссылка> ИЛИ просто голая ссылка на Google Drive
+    # Команда /url или голая ссылка на Google Drive
     text = message.get("text", "") or message.get("caption", "")
     is_url_command = text.startswith("/url")
     is_bare_gdrive = (
@@ -390,7 +423,7 @@ def telegram_webhook():
         re.search(r'https?://drive\.google\.com/\S+', text)
     )
 
-    if "text" in message and (is_url_command or is_bare_gdrive):
+    if is_url_command or is_bare_gdrive:
         if is_url_command:
             parts = text.split(maxsplit=1)
             if len(parts) < 2 or not parts[1].strip().startswith("http"):
@@ -401,9 +434,8 @@ def telegram_webhook():
                 return jsonify({"ok": True})
             url = parts[1].strip()
         else:
-            # Голая ссылка на Google Drive — извлекаем из текста
             match = re.search(r'https?://drive\.google\.com/\S+', text)
-            url = match.group(0).rstrip(")")  # убираем случайную скобку в конце
+            url = match.group(0).rstrip(")")
 
         thread = threading.Thread(target=process_from_url, args=(chat_id, url))
         thread.start()
