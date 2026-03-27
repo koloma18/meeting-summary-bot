@@ -17,8 +17,12 @@ app = Flask(__name__)
 # Устанавливаем ffmpeg при старте если не установлен
 if subprocess.run(["which", "ffmpeg"], capture_output=True).returncode != 0:
     print("ffmpeg не найден, устанавливаем...")
-    subprocess.run(["apt-get", "install", "-y", "ffmpeg"], check=True)
-    print("ffmpeg установлен")
+    subprocess.run(["apt-get", "update", "-y"], capture_output=True)
+    result = subprocess.run(["apt-get", "install", "-y", "ffmpeg"], capture_output=True)
+    if result.returncode == 0:
+        print("ffmpeg установлен")
+    else:
+        print(f"Не удалось установить ffmpeg: {result.stderr.decode()}")
 
 # ==================== НАСТРОЙКИ ====================
 
