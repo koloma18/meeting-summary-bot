@@ -14,6 +14,12 @@ from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
+# Устанавливаем ffmpeg при старте если не установлен
+if subprocess.run(["which", "ffmpeg"], capture_output=True).returncode != 0:
+    print("ffmpeg не найден, устанавливаем...")
+    subprocess.run(["apt-get", "install", "-y", "ffmpeg"], check=True)
+    print("ffmpeg установлен")
+
 # ==================== НАСТРОЙКИ ====================
 
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
