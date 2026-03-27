@@ -1,8 +1,11 @@
 import os
+import re
 import json
 import math
 import tempfile
+import threading
 import requests
+from datetime import datetime
 from flask import Flask, request, jsonify
 from pydub import AudioSegment
 from openai import OpenAI
@@ -72,17 +75,16 @@ def send_message(chat_id, text):
 
 
 def download_telegram_file(file_id):
-    """Скачать файл из Telegram во временный файл"""
+    """Скачать файл из Telegram во временный файл (лимит 20 МБ)"""
     resp = requests.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id})
     data = resp.json()
 
     # Telegram не даёт скачивать файлы >20 МБ через Bot API
     if not data.get("ok"):
         raise ValueError(
-            "Файл слишком большой для скачивания через Telegram (лимит 20 МБ).\n\n"
-            "Сожми аудио перед отправкой:\n"
-            "ffmpeg -i audio.m4a -ac 1 -ar 16000 -b:a 32k small.m4a\n\n"
-            "Или используй формат audio_only.m4a из Zoom — он обычно легче видео."
+            "Файл слишком большой (лимит Telegram — 20 МБ).\n\n"
+            "Загрузи файл на Google Drive с открытым доступом и отправь ссылку командой:\n"
+            "/url https://drive.google.com/file/d/XXXXX/view"
         )
 
     file_path = data["result"]["file_path"]
@@ -90,6 +92,54 @@ def download_telegram_file(file_id):
     response = requests.get(file_url, stream=True)
 
     ext = os.path.splitext(file_path)[1] or ".ogg"
+    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    for chunk in response.iter_content(chunk_size=8192):
+        tmp.write(chunk)
+    tmp.close()
+    return tmp.name
+
+
+def download_file_from_url(url):
+    """Скачать файл по прямой ссылке (поддерживает Google Drive)"""
+    file_id = None
+
+    # Конвертируем Google Drive ссылку в прямую ссылку скачивания
+    # Поддерживаем форматы: /file/d/ID/view и /open?id=ID
+    gdrive_match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+    if not gdrive_match:
+        gdrive_match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+
+    if gdrive_match:
+        file_id = gdrive_match.group(1)
+        url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+
+    session = requests.Session()
+    response = session.get(url, stream=True, allow_redirects=True)
+
+    # Google Drive для больших файлов показывает страницу подтверждения (предупреждение о вирусах)
+    # Обходим её через confirm-токен из HTML
+    if "text/html" in response.headers.get("Content-Type", ""):
+        confirm_match = re.search(r'confirm=([0-9A-Za-z_-]+)', response.text)
+        if confirm_match and file_id:
+            confirm_token = confirm_match.group(1)
+            response = session.get(
+                f"https://drive.google.com/uc?export=download&id={file_id}&confirm={confirm_token}",
+                stream=True
+            )
+        else:
+            raise ValueError(
+                "Не удалось скачать файл с Google Drive.\n"
+                "Убедись, что доступ к файлу открыт: Настройки → Доступ → Все, у кого есть ссылка."
+            )
+
+    # Определяем расширение из Content-Disposition или из URL
+    content_disposition = response.headers.get("Content-Disposition", "")
+    ext_match = re.search(r'filename[^;=\n]*=.*?\.([a-z0-9]+)["\s]', content_disposition, re.IGNORECASE)
+    if ext_match:
+        ext = f".{ext_match.group(1)}"
+    else:
+        ext = os.path.splitext(url.split("?")[0])[1] or ".m4a"
+
     tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
     for chunk in response.iter_content(chunk_size=8192):
         tmp.write(chunk)
@@ -197,12 +247,8 @@ def append_to_google_doc(summary_text, meeting_date):
 
     doc = service.documents().get(documentId=GOOGLE_DOC_ID).execute()
 
-    # Находим конец первого абзаца (заголовок документа)
-    # Вставляем после заголовка "РЕЗЮМЕ ВСТРЕЧ 2026 ГОДА" и разделителя
-    # Ищем позицию после второго элемента (заголовок + разделитель)
     content = doc["body"]["content"]
-    # Вставляем после заголовка: позиция конца 2-го элемента
-    # Если в документе меньше 3 элементов, вставляем в конец первого
+    # Вставляем после заголовка (3-й элемент), если документ достаточно длинный
     if len(content) > 2:
         insert_index = content[2]["startIndex"]
     else:
@@ -218,10 +264,9 @@ def append_to_google_doc(summary_text, meeting_date):
         body={"requests": [{"insertText": {"location": {"index": insert_index}, "text": full_text}}]},
     ).execute()
 
-    # Форматируем дату красным + жирным
+    # Форматируем дату красным + жирным, первую строку резюме — жирным
     date_start = insert_index + len(separator)
     date_end = date_start + len(meeting_date)
-
     first_newline = summary_text.index("\n") if "\n" in summary_text else len(summary_text)
 
     format_requests = [
@@ -249,14 +294,12 @@ def append_to_google_doc(summary_text, meeting_date):
         body={"requests": format_requests},
     ).execute()
 
-# ==================== ОБРАБОТКА АУДИО ====================
 
-def process_audio(chat_id, file_id):
-    """Основной пайплайн: скачать → транскрибировать → резюме → Google Doc"""
+# ==================== ОБЩИЙ ПАЙПЛАЙН ====================
+
+def run_pipeline(chat_id, audio_path):
+    """Общий пайплайн: обработать аудиофайл → транскрипция → резюме → Google Doc"""
     try:
-        send_message(chat_id, "⏳ Скачиваю файл...")
-        audio_path = download_telegram_file(file_id)
-
         send_message(chat_id, "✂️ Обрабатываю аудио...")
         chunks, duration_sec = split_audio(audio_path)
         os.unlink(audio_path)
@@ -268,8 +311,6 @@ def process_audio(chat_id, file_id):
         send_message(chat_id, "📝 Генерирую резюме...")
         summary = generate_summary(transcript, duration_str)
 
-        # Дата
-        from datetime import datetime
         months_ru = [
             "", "января", "февраля", "марта", "апреля", "мая", "июня",
             "июля", "августа", "сентября", "октября", "ноября", "декабря",
@@ -286,6 +327,30 @@ def process_audio(chat_id, file_id):
     except Exception as e:
         send_message(chat_id, f"❌ Ошибка: {str(e)}")
         print(f"Error: {e}")
+
+
+def process_audio(chat_id, file_id):
+    """Скачать файл из Telegram и запустить пайплайн"""
+    try:
+        send_message(chat_id, "⏳ Скачиваю файл...")
+        audio_path = download_telegram_file(file_id)
+    except Exception as e:
+        send_message(chat_id, f"❌ Ошибка: {str(e)}")
+        print(f"Error: {e}")
+        return
+    run_pipeline(chat_id, audio_path)
+
+
+def process_from_url(chat_id, url):
+    """Скачать файл по ссылке и запустить пайплайн"""
+    try:
+        send_message(chat_id, "⏳ Скачиваю файл по ссылке...")
+        audio_path = download_file_from_url(url)
+    except Exception as e:
+        send_message(chat_id, f"❌ Ошибка: {str(e)}")
+        print(f"Error: {e}")
+        return
+    run_pipeline(chat_id, audio_path)
 
 
 # ==================== ВЕБХУК TELEGRAM ====================
@@ -309,10 +374,27 @@ def telegram_webhook():
     if "text" in message and message["text"].startswith("/start"):
         send_message(chat_id, (
             "👋 Привет! Я бот для создания резюме встреч.\n\n"
-            "Отправь мне аудио- или видеофайл записи встречи, "
+            "Отправь мне аудио- или видеофайл записи встречи (до 20 МБ), "
             "и я создам резюме в Google Doc.\n\n"
+            "Для больших файлов загрузи запись на Google Drive и отправь ссылку:\n"
+            "/url https://drive.google.com/file/d/XXXXX/view\n\n"
             "Поддерживаемые форматы: mp3, mp4, m4a, ogg, wav, webm"
         ))
+        return jsonify({"ok": True})
+
+    # Команда /url <ссылка>
+    if "text" in message and message["text"].startswith("/url"):
+        parts = message["text"].split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip().startswith("http"):
+            send_message(chat_id, (
+                "⚠️ Укажи ссылку после команды.\n\n"
+                "Пример:\n/url https://drive.google.com/file/d/XXXXX/view"
+            ))
+            return jsonify({"ok": True})
+
+        url = parts[1].strip()
+        thread = threading.Thread(target=process_from_url, args=(chat_id, url))
+        thread.start()
         return jsonify({"ok": True})
 
     # Обработка аудио/видео/документа
@@ -331,7 +413,6 @@ def telegram_webhook():
         if mime.startswith(("audio/", "video/")) or mime == "application/octet-stream":
             file_id = message["document"]["file_id"]
         else:
-            # Проверяем по расширению
             fname = message["document"].get("file_name", "")
             valid_ext = (".mp3", ".mp4", ".m4a", ".ogg", ".wav", ".webm", ".oga", ".flac")
             if fname.lower().endswith(valid_ext):
@@ -341,8 +422,6 @@ def telegram_webhook():
                 return jsonify({"ok": True})
 
     if file_id:
-        # Запускаем обработку в отдельном потоке, чтобы Telegram не ждал
-        import threading
         thread = threading.Thread(target=process_audio, args=(chat_id, file_id))
         thread.start()
         return jsonify({"ok": True})
@@ -356,7 +435,6 @@ def telegram_webhook():
 @app.route("/set_webhook", methods=["GET"])
 def set_webhook():
     """Вызови этот URL один раз для регистрации вебхука Telegram"""
-    # Railway даёт домен через переменную RAILWAY_PUBLIC_DOMAIN
     domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "")
     if not domain:
         return jsonify({"error": "RAILWAY_PUBLIC_DOMAIN not set"}), 400
